@@ -3,8 +3,14 @@ name: Daily Solar Generation Report
 on:
   schedule:
     # 매일 오후 6시 (KST) = UTC 09:00
+    # GitHub Actions 스케줄러는 지연될 수 있으므로 정확한 시간 보장 안됨
     - cron: '0 9 * * *'
   workflow_dispatch:  # 수동 실행 가능
+
+# 동시 실행 방지
+concurrency:
+  group: daily-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape-and-report:

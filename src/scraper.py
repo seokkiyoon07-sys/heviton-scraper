@@ -257,30 +257,57 @@ class HevitonScraper:
                     if rows:
                         header = rows[0].get_text(strip=True)
                         if '기간' in header and '발전량' in header:
-                            # 최근 N일 데이터 추출 (역순으로 저장 - 최근순)
-                            for row in rows[1:days+1]:
+                            # 모든 데이터 행 수집
+                            all_data = []
+                            for row in rows[1:]:  # 헤더 제외한 모든 행
                                 cols = row.find_all(['td', 'th'])
                                 if len(cols) >= 2:
                                     date_text = cols[0].get_text(strip=True)
                                     value_text = cols[1].get_text(strip=True)
                                     # 날짜 형식 확인 (YYYY.MM.DD 또는 MM/DD)
+                                    # "합계", "기간" 등 헤더/푸터 행 제외
                                     if date_text and value_text and ('.' in date_text or '/' in date_text):
+                                        if '합계' in date_text or '기간' in date_text:
+                                            continue  # 합계 행 건너뛰기
                                         # 날짜를 MM/DD 형식으로 변환
                                         if '.' in date_text:
                                             parts = date_text.split('.')
                                             if len(parts) >= 3:
                                                 date_text = f"{parts[1]}/{parts[2]}"
-                                        recent_data.append({
+                                        all_data.append({
                                             "date": date_text,
                                             "generation": value_text,
                                         })
+                            # 날짜 기준 정렬 후 최근 N일 추출
+                            if all_data:
+                                # 날짜를 파싱하여 정렬 (MM/DD 형식, 연말/연초 처리)
+                                today = datetime.now()
+                                current_year = today.year
+                                current_month = today.month
+
+                                def parse_date_to_comparable(item):
+                                    try:
+                                        parts = item["date"].split("/")
+                                        month, day = int(parts[0]), int(parts[1])
+                                        # 연말에 1월 데이터가 있으면 다음 해로 처리
+                                        year = current_year
+                                        if current_month == 12 and month == 1:
+                                            year = current_year + 1
+                                        elif current_month == 1 and month == 12:
+                                            year = current_year - 1
+                                        return (year, month, day)
+                                    except:
+                                        return (0, 0, 0)
+
+                                all_data.sort(key=parse_date_to_comparable)
+                                recent_data = all_data[-days:]
                             break  # 일별 테이블 찾았으면 종료
 
             # 방법 3: 모니터링 페이지의 시간별 그래프 데이터로 일별 합산
             if not recent_data:
-                # 최근 5일 날짜 생성
+                # 최근 5일 날짜 생성 (오늘 포함)
                 today = datetime.now()
-                for i in range(days):
+                for i in range(days - 1, -1, -1):  # 역순으로 생성하여 오래된 날짜부터 최근 날짜 순서로
                     date = today - timedelta(days=i)
                     recent_data.append({
                         "date": date.strftime("%m/%d"),
