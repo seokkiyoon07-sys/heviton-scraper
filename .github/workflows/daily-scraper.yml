@@ -1,0 +1,44 @@
+name: Daily Solar Generation Report
+
+on:
+  schedule:
+    # 매일 오후 6시 (KST) = UTC 09:00
+    - cron: '0 9 * * *'
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  scrape-and-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          HEVITON_USER_ID: ${{ secrets.HEVITON_USER_ID }}
+          HEVITON_PASSWORD: ${{ secrets.HEVITON_PASSWORD }}
+          HEVITON_BASE_URL: ${{ secrets.HEVITON_BASE_URL }}
+          JANDI_WEBHOOK_URL: ${{ secrets.JANDI_WEBHOOK_URL }}
+        run: python main.py
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scraper-logs
+          path: logs/
+          retention-days: 7

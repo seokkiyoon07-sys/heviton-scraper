@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  heviton-scraper:
+    build: .
+    container_name: heviton-scraper
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    restart: "no"
+    # cron 스케줄링은 호스트에서 docker-compose run으로 실행
+    # 또는 아래 주석 해제하여 컨테이너 내에서 cron 실행
+    # command: ["cron", "-f"]
+
+  # 테스트용: 웹훅 테스트만 실행
+  test-webhook:
+    build: .
+    container_name: heviton-test
+    env_file:
+      - .env
+    command: ["python", "main.py", "--test"]
+    profiles:
+      - test

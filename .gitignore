@@ -1,0 +1,30 @@
+# 환경변수 (민감정보)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# 데이터 파일 (선택적)
+# data/*.csv
+# data/*.xlsx
+
+# 로그
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+cookies.txt
