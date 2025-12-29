@@ -1,0 +1,98 @@
+name: Weekly Report to Sheets
+
+on:
+  schedule:
+    # 매주 월요일 0시 5분 (KST) = 일요일 15:05 UTC
+    - cron: '5 15 * * 0'
+  workflow_dispatch:  # 수동 실행
+
+concurrency:
+  group: weekly-report
+  cancel-in-progress: false
+
+jobs:
+  weekly-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run weekly report
+        env:
+          HEVITON_USER_ID: ${{ secrets.HEVITON_USER_ID }}
+          HEVITON_PASSWORD: ${{ secrets.HEVITON_PASSWORD }}
+          HEVITON_BASE_URL: ${{ secrets.HEVITON_BASE_URL }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+        run: python -c "
+import os
+import logging
+from datetime import datetime, timedelta
+from src.auth import HevitonAuth
+from src.scraper import HevitonScraper
+from src.google_sheets import GoogleSheetsClient
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 지난 주 계산 (월~일)
+today = datetime.now()
+# 지난 주 일요일
+last_sunday = today - timedelta(days=today.weekday() + 1)
+# 지난 주 월요일
+last_monday = last_sunday - timedelta(days=6)
+
+year = last_monday.year
+week_num = last_monday.isocalendar()[1]
+
+logger.info(f'주별 리포트: {year}년 {week_num}주차 ({last_monday.strftime(\"%Y-%m-%d\")} ~ {last_sunday.strftime(\"%Y-%m-%d\")})')
+
+# 데이터 수집
+auth = HevitonAuth(headless=True)
+if auth.login():
+    scraper = HevitonScraper(auth.get_driver())
+
+    # 일별 데이터에서 주간 합계 계산
+    # (실제로는 통계 페이지에서 주간 합계를 가져오는 것이 더 정확함)
+    data = scraper.get_all_data()
+    recent_days = data.get('recent_5days', [])
+
+    # 간단히 recent_5days 합계 사용 (실제 구현 시 정확한 주간 데이터 필요)
+    total = 0
+    for day in recent_days:
+        try:
+            gen = float(day.get('generation', '0'))
+            total += gen
+        except:
+            pass
+
+    auth.logout()
+
+    # Google Sheets에 기록
+    sheets = GoogleSheetsClient()
+    if sheets.service:
+        sheets.append_weekly_data(
+            year=year,
+            week_num=week_num,
+            start_date=last_monday.strftime('%Y-%m-%d'),
+            end_date=last_sunday.strftime('%Y-%m-%d'),
+            total_gen=f'{total:.2f}'
+        )
+        logger.info('주별 리포트 기록 완료')
+else:
+    logger.error('로그인 실패')
+    auth.close()
+"

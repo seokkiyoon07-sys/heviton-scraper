@@ -1,0 +1,83 @@
+name: Monthly Report to Sheets
+
+on:
+  schedule:
+    # 매월 1일 0시 (KST) = 전날 15:00 UTC
+    - cron: '0 15 1 * *'
+  workflow_dispatch:  # 수동 실행
+
+concurrency:
+  group: monthly-report
+  cancel-in-progress: false
+
+jobs:
+  monthly-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run monthly report
+        env:
+          HEVITON_USER_ID: ${{ secrets.HEVITON_USER_ID }}
+          HEVITON_PASSWORD: ${{ secrets.HEVITON_PASSWORD }}
+          HEVITON_BASE_URL: ${{ secrets.HEVITON_BASE_URL }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+        run: python -c "
+import os
+import logging
+from datetime import datetime, timedelta
+from src.auth import HevitonAuth
+from src.scraper import HevitonScraper
+from src.google_sheets import GoogleSheetsClient
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 전월 계산
+today = datetime.now()
+first_of_month = today.replace(day=1)
+last_month_end = first_of_month - timedelta(days=1)
+year_month = last_month_end.strftime('%Y-%m')
+
+logger.info(f'월별 리포트: {year_month}')
+
+# 데이터 수집
+auth = HevitonAuth(headless=True)
+if auth.login():
+    scraper = HevitonScraper(auth.get_driver())
+    data = scraper.get_all_data()
+    auth.logout()
+
+    dashboard = data.get('dashboard', {})
+    month_gen = dashboard.get('month_generation', '')
+    total_gen = dashboard.get('total_generation', '')
+
+    # Google Sheets에 기록
+    sheets = GoogleSheetsClient()
+    if sheets.service:
+        sheets.append_monthly_data({
+            'dashboard': {
+                'month_generation': month_gen,
+                'total_generation': total_gen,
+            }
+        })
+        logger.info(f'월별 리포트 기록 완료: {year_month} - {month_gen} kWh')
+else:
+    logger.error('로그인 실패')
+    auth.close()
+"

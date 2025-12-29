@@ -5,8 +5,8 @@ Google Sheets 연동 모듈
 import json
 import logging
 import os
-from datetime import datetime
-from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -255,9 +255,199 @@ class GoogleSheetsClient:
             logger.error(f"월별 데이터 기록 실패: {e}")
             return False
 
+    def append_weekly_data(self, year: int, week_num: int, start_date: str,
+                           end_date: str, total_gen: str) -> bool:
+        """
+        주별 발전량 데이터 추가
+
+        Args:
+            year: 년도
+            week_num: 주차
+            start_date: 시작일 (YYYY-MM-DD)
+            end_date: 종료일 (YYYY-MM-DD)
+            total_gen: 총 발전량 (kWh)
+
+        Returns:
+            성공 여부
+        """
+        if not self.service:
+            logger.warning("Google Sheets 서비스가 초기화되지 않았습니다.")
+            return False
+
+        try:
+            self._ensure_sheet_exists(SHEET_WEEKLY)
+
+            week_label = f"{year}년 {week_num}주차"
+            record_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 기존 데이터 확인 (같은 주차 데이터가 있으면 업데이트)
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{SHEET_WEEKLY}!A:A"
+            ).execute()
+
+            existing_values = result.get("values", [])
+            row_index = None
+
+            for i, row in enumerate(existing_values):
+                if row and row[0] == week_label:
+                    row_index = i + 1
+                    break
+
+            row = [[week_label, start_date, end_date, total_gen, record_time]]
+
+            if row_index:
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{SHEET_WEEKLY}!A{row_index}:E{row_index}",
+                    valueInputOption="RAW",
+                    body={"values": row}
+                ).execute()
+                logger.info(f"주별 데이터 업데이트: {week_label} - {total_gen} kWh")
+            else:
+                self.service.spreadsheets().values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{SHEET_WEEKLY}!A:E",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": row}
+                ).execute()
+                logger.info(f"주별 데이터 기록: {week_label} - {total_gen} kWh")
+
+            return True
+
+        except HttpError as e:
+            logger.error(f"주별 데이터 기록 실패: {e}")
+            return False
+
+    def bulk_insert_daily(self, daily_records: List[Dict[str, Any]]) -> bool:
+        """
+        일별 데이터 일괄 입력
+
+        Args:
+            daily_records: [{"date": "YYYY-MM-DD", "generation": "123.45", "status": "정상"}, ...]
+
+        Returns:
+            성공 여부
+        """
+        if not self.service:
+            return False
+
+        try:
+            self._ensure_sheet_exists(SHEET_DAILY)
+
+            rows = []
+            for record in daily_records:
+                rows.append([
+                    record.get("date", ""),
+                    record.get("generation", ""),
+                    record.get("current_power", "-"),
+                    record.get("status", "정상"),
+                    record.get("record_time", datetime.now().strftime("%H:%M:%S"))
+                ])
+
+            if rows:
+                self.service.spreadsheets().values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{SHEET_DAILY}!A:E",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": rows}
+                ).execute()
+                logger.info(f"일별 데이터 {len(rows)}건 일괄 입력 완료")
+
+            return True
+
+        except HttpError as e:
+            logger.error(f"일별 데이터 일괄 입력 실패: {e}")
+            return False
+
+    def bulk_insert_weekly(self, weekly_records: List[Dict[str, Any]]) -> bool:
+        """
+        주별 데이터 일괄 입력
+
+        Args:
+            weekly_records: [{"week_label": "2024년 52주차", "start_date": "...", "end_date": "...", "total": "..."}, ...]
+
+        Returns:
+            성공 여부
+        """
+        if not self.service:
+            return False
+
+        try:
+            self._ensure_sheet_exists(SHEET_WEEKLY)
+
+            rows = []
+            for record in weekly_records:
+                rows.append([
+                    record.get("week_label", ""),
+                    record.get("start_date", ""),
+                    record.get("end_date", ""),
+                    record.get("total", ""),
+                    record.get("record_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                ])
+
+            if rows:
+                self.service.spreadsheets().values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{SHEET_WEEKLY}!A:E",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": rows}
+                ).execute()
+                logger.info(f"주별 데이터 {len(rows)}건 일괄 입력 완료")
+
+            return True
+
+        except HttpError as e:
+            logger.error(f"주별 데이터 일괄 입력 실패: {e}")
+            return False
+
+    def bulk_insert_monthly(self, monthly_records: List[Dict[str, Any]]) -> bool:
+        """
+        월별 데이터 일괄 입력
+
+        Args:
+            monthly_records: [{"year_month": "2024-12", "total": "1234.56", "cumulative": "28.90"}, ...]
+
+        Returns:
+            성공 여부
+        """
+        if not self.service:
+            return False
+
+        try:
+            self._ensure_sheet_exists(SHEET_MONTHLY)
+
+            rows = []
+            for record in monthly_records:
+                rows.append([
+                    record.get("year_month", ""),
+                    record.get("total", ""),
+                    record.get("cumulative", ""),
+                    record.get("record_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                ])
+
+            if rows:
+                self.service.spreadsheets().values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{SHEET_MONTHLY}!A:D",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": rows}
+                ).execute()
+                logger.info(f"월별 데이터 {len(rows)}건 일괄 입력 완료")
+
+            return True
+
+        except HttpError as e:
+            logger.error(f"월별 데이터 일괄 입력 실패: {e}")
+            return False
+
     def record_all(self, data: Dict[str, Any]) -> bool:
         """
-        모든 시트에 데이터 기록
+        모든 시트에 데이터 기록 (일별만 - 주별/월별은 별도 스케줄)
 
         Args:
             data: 크롤링된 전체 데이터
@@ -266,9 +456,7 @@ class GoogleSheetsClient:
             성공 여부
         """
         daily_ok = self.append_daily_data(data)
-        monthly_ok = self.append_monthly_data(data)
-
-        return daily_ok and monthly_ok
+        return daily_ok
 
 
 # 테스트용
