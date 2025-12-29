@@ -25,6 +25,7 @@ from config.settings import LOGGING_CONFIG, LOGS_DIR
 from src.auth import HevitonAuth
 from src.scraper import HevitonScraper
 from src.jandi_webhook import JandiWebhook
+from src.google_sheets import GoogleSheetsClient
 
 # 환경변수 로드
 load_dotenv()
@@ -88,6 +89,19 @@ def run_scraper(args):
             logger.info("잔디 전송 완료")
         else:
             logger.warning("잔디 전송 실패")
+
+        # Google Sheets에 기록
+        try:
+            sheets = GoogleSheetsClient()
+            if sheets.service:
+                if sheets.record_all(data):
+                    logger.info("Google Sheets 기록 완료")
+                else:
+                    logger.warning("Google Sheets 기록 일부 실패")
+            else:
+                logger.info("Google Sheets 연동 미설정 (선택사항)")
+        except Exception as e:
+            logger.warning(f"Google Sheets 기록 실패: {e}")
 
         logger.info("크롤러 정상 종료")
         return 0

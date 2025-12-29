@@ -39,6 +39,7 @@ jobs:
           HEVITON_PASSWORD: ${{ secrets.HEVITON_PASSWORD }}
           HEVITON_BASE_URL: ${{ secrets.HEVITON_BASE_URL }}
           JANDI_WEBHOOK_URL: ${{ secrets.JANDI_WEBHOOK_URL }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: python main.py
 
       - name: Upload logs
