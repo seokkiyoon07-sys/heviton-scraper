@@ -186,11 +186,13 @@ class HevitonScraper:
             except Exception as e:
                 logger.debug(f"컨버터 상태 상세 조회 실패: {e}")
 
-            # 페이지에서 에러 텍스트 확인
-            if "에러" in page_source or "오류" in page_source or "Error" in page_source:
-                # 실제 에러인지 확인 (단순 UI 텍스트가 아닌)
-                if "에러 발생" in page_source or "통신 오류" in page_source:
+            # 실제 에러 상태만 확인 (단순 UI 텍스트가 아닌 실제 상태 메시지)
+            error_keywords = ["에러 발생", "통신 오류", "통신 이상", "장애 발생", "고장"]
+            for keyword in error_keywords:
+                if keyword in page_source:
                     status_data["is_normal"] = False
+                    status_data["error_messages"].append(keyword)
+                    break
 
             logger.info(f"컨버터 상태: {'정상' if status_data['is_normal'] else '이상'}")
             return status_data
