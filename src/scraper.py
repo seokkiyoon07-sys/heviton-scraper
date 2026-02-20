@@ -1,120 +1,223 @@
 """
-Heviton 모니터링 시스템 데이터 크롤러 (Selenium 기반)
+Heviton REMS 모니터링 시스템 데이터 수집 (REST API 기반)
 """
 import logging
-import time
-import re
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from bs4 import BeautifulSoup
+import requests
 
 import sys
 sys.path.append(str(__file__).rsplit('/', 2)[0])
-from config.settings import HEVITON_CONFIG
+from config.settings import HEVITON_CONFIG, API_ENDPOINTS, REQUEST_CONFIG
 
 logger = logging.getLogger(__name__)
 
 
 class HevitonScraper:
-    """Heviton 발전량 데이터 크롤러 (Selenium 기반)"""
+    """Heviton 발전량 데이터 수집 (REST API 기반)"""
 
-    def __init__(self, driver: webdriver.Chrome):
+    def __init__(self, session: requests.Session):
         """
         Args:
-            driver: 인증된 Selenium WebDriver
+            session: 인증된 requests.Session (HevitonAuth.get_session())
         """
-        self.driver = driver
-        self.base_url = HEVITON_CONFIG["base_url"]
+        self.session = session
+        self.api_base = HEVITON_CONFIG["api_base"]
+        self._plant_id: Optional[str] = None
+        self._plant_name: Optional[str] = None
+        self._energy_code: Optional[str] = None
+
+    def _api_get(self, endpoint: str, url_suffix: str = "") -> Optional[Dict]:
+        """API GET 요청"""
+        url = f"{self.api_base}/{endpoint}"
+        if url_suffix:
+            url = f"{url}/{url_suffix}"
+        try:
+            response = self.session.get(url, timeout=REQUEST_CONFIG["timeout"])
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError:
+            logger.error(f"API 오류 ({endpoint}): HTTP {response.status_code} - {response.text[:300]}")
+            return None
+        except Exception as e:
+            logger.error(f"API 요청 실패 ({endpoint}): {e}")
+            return None
+
+    def _api_post(self, endpoint: str, payload: Optional[Dict] = None) -> Optional[Dict]:
+        """API POST 요청"""
+        url = f"{self.api_base}/{endpoint}"
+        try:
+            response = self.session.post(url, json=payload or {}, timeout=REQUEST_CONFIG["timeout"])
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError:
+            logger.error(f"API 오류 ({endpoint}): HTTP {response.status_code} - {response.text[:300]}")
+            return None
+        except Exception as e:
+            logger.error(f"API 요청 실패 ({endpoint}): {e}")
+            return None
+
+    def _get_response_data(self, response: Optional[Dict]) -> Any:
+        """표준 응답 envelope에서 data 추출: { result: {...}, data: {...} }"""
+        if not response or not isinstance(response, dict):
+            return None
+        # 표준 구조: result.code == 0이면 성공
+        result = response.get("result", {})
+        if isinstance(result, dict) and result.get("code", -1) != 0:
+            msg = result.get("message", "")
+            if msg:
+                logger.warning(f"API 응답 오류: code={result.get('code')}, message={msg}")
+            return None
+        return response.get("data")
+
+    def _extract_value(self, data: dict, *keys) -> Optional[Any]:
+        """여러 키 이름으로 값 추출 시도"""
+        for key in keys:
+            val = data.get(key)
+            if val is not None:
+                return val
+        return None
+
+    def _extract_list(self, data: Any) -> list:
+        """응답에서 리스트 데이터 추출"""
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # data.list 패턴 (가장 흔함)
+            for key in ("list", "data", "items", "content", "result"):
+                inner = data.get(key)
+                if isinstance(inner, list):
+                    return inner
+        return []
+
+    def _get_plant_info(self) -> bool:
+        """발전소 정보 조회 (최초 1회 후 캐시) - endUserInfo GET 사용"""
+        if self._plant_id and self._plant_name:
+            return True
+
+        # 1차: endUserInfo (GET) - 일반 사용자 전용
+        data = self._api_get(API_ENDPOINTS["end_user_info"])
+        if data:
+            payload = self._get_response_data(data)
+            if not payload:
+                # envelope 없이 직접 data인 경우
+                payload = data.get("data", data)
+
+            if isinstance(payload, dict):
+                self._plant_id = str(payload.get("plantId", payload.get("plant_id", "")))
+                self._plant_name = payload.get("plantName", payload.get("plant_name", ""))
+                self._energy_code = str(payload.get("energyCode", payload.get("energy_code", "501")))
+                if self._plant_id and self._plant_name:
+                    logger.info(f"발전소 정보: id={self._plant_id}, name={self._plant_name}, energy={self._energy_code}")
+                    return True
+
+        # 2차: plantInfo (GET with plantId suffix) - plantId를 이미 알고 있는 경우
+        if self._plant_id:
+            info_data = self._api_get(API_ENDPOINTS["plant_info"], url_suffix=self._plant_id)
+            if info_data:
+                payload = self._get_response_data(info_data) or info_data.get("data", info_data)
+                if isinstance(payload, dict):
+                    self._plant_name = self._plant_name or payload.get("plantName", payload.get("name", ""))
+                    self._energy_code = self._energy_code or str(payload.get("energyCode", "501"))
+                    if self._plant_name:
+                        logger.info(f"발전소 정보 (plantInfo): name={self._plant_name}, energy={self._energy_code}")
+                        return True
+
+        logger.error("발전소 정보를 조회할 수 없음")
+        return False
+
+    def _get_plant_id(self) -> Optional[str]:
+        """하위 호환성: 발전소 ID만 반환"""
+        self._get_plant_info()
+        return self._plant_id
+
+    def _make_plant_payload(self, **extra) -> Dict:
+        """발전소 기본 POST payload 생성
+
+        주의: API의 'plant_name' 필드에는 사람이 읽는 이름이 아닌
+        plantId (시스템 ID)를 전달해야 함
+        """
+        payload = {
+            "plant_name": self._plant_id,  # plantId를 plant_name으로 전달 (API 규칙)
+            "energy": self._energy_code,
+        }
+        payload.update(extra)
+        return payload
 
     def get_monitoring_data(self) -> Dict[str, Any]:
         """
-        모니터링 페이지에서 발전량 데이터 추출
+        대시보드 발전량 데이터 조회
 
         Returns:
-            발전량 데이터 (현재, 오늘, 이번달, 누적)
+            발전량 데이터 (현재, 오늘, 이번달, 누적, 발전시간, 가동일수 등)
         """
         logger.info("모니터링 데이터 조회")
 
+        data = {
+            "current_power": None,
+            "today_generation": None,
+            "month_generation": None,
+            "total_generation": None,
+            "day_avg_time": None,
+            "month_avg_time": None,
+            "tot_avg_time": None,
+            "day_diff": None,
+            "month_diff": None,
+            "oper_day": None,
+            "recent_date": None,
+        }
+
         try:
-            # 모니터링 페이지로 이동
-            url = f"{self.base_url}/monitoring/status/monitoring.do?ua=m&inType=web"
-            self.driver.get(url)
-            time.sleep(3)  # 페이지 및 JavaScript 로드 대기
+            if not self._get_plant_info():
+                return {"collected_at": datetime.now().isoformat(), "data": data}
 
-            page_source = self.driver.page_source
-            soup = BeautifulSoup(page_source, 'lxml')
+            # plantDetailStatus (POST) - 발전소 운영 정보
+            resp = self._api_post(
+                API_ENDPOINTS["plant_operation_info"],
+                self._make_plant_payload()
+            )
+            if resp:
+                payload = self._get_response_data(resp)
+                if not payload:
+                    payload = resp.get("data", resp)
+                if isinstance(payload, dict):
+                    data["current_power"] = self._extract_value(
+                        payload, "power", "currentPower", "current_power", "nowPower", "realPower"
+                    )
+                    data["today_generation"] = self._extract_value(
+                        payload, "day_gen", "todayGeneration", "today_generation", "todayGen", "dayGen"
+                    )
+                    data["month_generation"] = self._extract_value(
+                        payload, "month_gen", "monthGeneration", "month_generation", "monthGen"
+                    )
+                    data["total_generation"] = self._extract_value(
+                        payload, "tot_gen", "totalGeneration", "total_generation", "totalGen", "accumGen"
+                    )
+                    data["day_avg_time"] = payload.get("day_avg_time")
+                    data["month_avg_time"] = payload.get("month_avg_time")
+                    data["tot_avg_time"] = payload.get("tot_avg_time")
+                    data["day_diff"] = payload.get("day_diff")
+                    data["month_diff"] = payload.get("month_diff")
+                    data["oper_day"] = payload.get("oper_day")
+                    data["recent_date"] = payload.get("recentDate")
 
-            data = {
-                "current_power": None,      # 현재 발전량 (kW)
-                "today_generation": None,   # 오늘 발전량 (kWh)
-                "month_generation": None,   # 이번달 발전량 (kWh)
-                "total_generation": None,   # 누적 발전량 (kWh)
-            }
+            # 소수점 2자리 반올림 (숫자 필드만)
+            for key in data:
+                if isinstance(data[key], (int, float)) and key not in ("oper_day",):
+                    data[key] = round(data[key], 2)
 
-            # JavaScript 변수에서 데이터 추출 시도
-            # 페이지 소스에서 발전량 관련 값 찾기
-
-            # 방법 1: JavaScript 실행하여 값 추출
-            try:
-                # 페이지 로드 후 추가 대기 (API 호출 완료 대기)
-                time.sleep(5)
-
-                # JavaScript로 데이터 추출 시도
-                scripts = [
-                    "return document.querySelector('.now .num')?.innerText;",
-                    "return document.querySelector('.today .num')?.innerText;",
-                    "return document.querySelector('.month .num')?.innerText;",
-                    "return document.querySelector('.accrue .num')?.innerText;",
-                ]
-
-                for i, script in enumerate(scripts):
-                    try:
-                        value = self.driver.execute_script(script)
-                        if value:
-                            if i == 0:
-                                data["current_power"] = value
-                            elif i == 1:
-                                data["today_generation"] = value
-                            elif i == 2:
-                                data["month_generation"] = value
-                            elif i == 3:
-                                data["total_generation"] = value
-                    except:
-                        pass
-
-            except Exception as e:
-                logger.debug(f"JavaScript 데이터 추출 실패: {e}")
-
-            # 방법 2: HTML에서 직접 추출
-            if not any(data.values()):
-                # .num 클래스 요소들 찾기
-                num_elements = soup.find_all(class_='num')
-                for elem in num_elements:
-                    text = elem.get_text(strip=True)
-                    if text:
-                        logger.debug(f"발견된 값: {text}")
-
-                # 발전량 섹션 찾기
-                sections = soup.find_all(class_=['now', 'today', 'month', 'accrue'])
-                for section in sections:
-                    num = section.find(class_='num')
-                    if num:
-                        value = num.get_text(strip=True)
-                        section_class = section.get('class', [])
-                        if 'now' in section_class:
-                            data["current_power"] = value
-                        elif 'today' in section_class:
-                            data["today_generation"] = value
-                        elif 'month' in section_class:
-                            data["month_generation"] = value
-                        elif 'accrue' in section_class:
-                            data["total_generation"] = value
+            # 0.0 값도 유효한 데이터로 취급 (발전소 미가동 시)
+            # 핵심 4개 필드가 모두 None일 때 대안 시도
+            core_keys = ("current_power", "today_generation", "month_generation", "total_generation")
+            if all(data[k] is None for k in core_keys):
+                resp2 = self._api_post(API_ENDPOINTS["device_status"])
+                if resp2:
+                    payload = self._get_response_data(resp2) or resp2.get("data", resp2)
+                    if isinstance(payload, dict):
+                        gen = payload.get("gen", {})
+                        if isinstance(gen, dict):
+                            data["total_generation"] = gen.get("primary")
 
             logger.info(f"추출된 모니터링 데이터: {data}")
             return {
@@ -124,75 +227,84 @@ class HevitonScraper:
 
         except Exception as e:
             logger.error(f"모니터링 데이터 조회 실패: {e}")
-            return {"error": str(e), "data": {}}
+            return {"error": str(e), "data": data}
 
     def get_converter_status(self) -> Dict[str, Any]:
         """
-        설비상태 페이지에서 컨버터/인버터 상태 확인
+        설비(컨버터/인버터) 상태 확인
 
         Returns:
             컨버터 상태 정보
         """
         logger.info("컨버터 상태 조회")
 
+        status_data = {
+            "is_normal": True,
+            "converters": [],
+            "error_messages": [],
+        }
+
         try:
-            # 설비상태 페이지로 이동
-            url = f"{self.base_url}/monitoring/status/inverter.do?ua=m&inType=web&energyCode=501"
-            self.driver.get(url)
-            time.sleep(3)
+            if not self._get_plant_info():
+                return status_data
 
-            page_source = self.driver.page_source
-            soup = BeautifulSoup(page_source, 'lxml')
+            # plantDetailComposition (POST) - 설비 구성
+            resp = self._api_post(
+                API_ENDPOINTS["plant_devices"],
+                self._make_plant_payload()
+            )
+            if resp:
+                payload = self._get_response_data(resp) or resp.get("data", resp)
+                devices = self._extract_list(payload) if payload else []
+                for device in devices:
+                    if not isinstance(device, dict):
+                        continue
+                    # 실제 응답 필드: serialNo, instanceId, power, gen, capacity, status, imei
+                    serial = device.get("serialNo", device.get("instanceId", ""))
+                    name = f"인버터 {serial}" if serial else self._extract_value(
+                        device, "deviceName", "name", "inverterName"
+                    ) or "Unknown"
+                    status_code = str(device.get("status", ""))
 
-            status_data = {
-                "is_normal": True,
-                "converters": [],
-                "error_messages": [],
-            }
+                    # 상태 코드: "000"=정상/대기, "001"=경고, "002"=발전중, "003"=미운영
+                    is_ok = status_code in ("000", "001", "002", "")
+                    power = device.get("power", 0)
+                    gen = device.get("gen", 0)
+                    status_text = "정상"
+                    if power and float(power) > 0:
+                        status_text = f"발전중 ({power}kW)"
+                    elif status_code == "003":
+                        status_text = "미운영"
+                        is_ok = False
 
-            # 컨버터 상태 확인 - JavaScript로 실행
-            try:
-                time.sleep(3)
+                    status_data["converters"].append({
+                        "name": str(name),
+                        "status": status_text,
+                        "generation": gen,
+                    })
 
-                # 에러 상태 확인
-                error_elements = self.driver.find_elements(By.CLASS_NAME, "error")
-                if error_elements:
-                    for elem in error_elements:
-                        if elem.is_displayed():
-                            status_data["is_normal"] = False
-                            status_data["error_messages"].append(elem.text)
+                    if not is_ok:
+                        status_data["is_normal"] = False
 
-                # 정상 상태 아이콘 확인
-                normal_icons = self.driver.find_elements(By.CSS_SELECTOR, ".status.normal, .status.on, .ico_on")
-                error_icons = self.driver.find_elements(By.CSS_SELECTOR, ".status.error, .status.off, .ico_off, .ico_error")
-
-                if error_icons:
-                    for icon in error_icons:
-                        if icon.is_displayed():
-                            status_data["is_normal"] = False
-
-                # 컨버터 정보 추출
-                converter_sections = soup.find_all(class_=['converter', 'device_box', 'inverter_box'])
-                for section in converter_sections:
-                    name = section.find(class_=['name', 'title', 'device_name'])
-                    status = section.find(class_=['status', 'state'])
-                    if name:
-                        converter_info = {
-                            "name": name.get_text(strip=True),
-                            "status": "정상" if status and "error" not in str(status.get('class', [])) else "확인필요"
-                        }
-                        status_data["converters"].append(converter_info)
-
-            except Exception as e:
-                logger.debug(f"컨버터 상태 상세 조회 실패: {e}")
-
-            # 실제 에러 상태만 확인 (단순 UI 텍스트가 아닌 실제 상태 메시지)
-            error_keywords = ["에러 발생", "통신 오류", "통신 이상", "장애 발생", "고장"]
-            for keyword in error_keywords:
-                if keyword in page_source:
-                    status_data["is_normal"] = False
-                    status_data["error_messages"].append(keyword)
-                    break
+            # dashboardEvent (POST) - 오늘의 이벤트에서 에러 확인
+            # 참고: 이 엔드포인트는 특수한 DTO 구조 필요, 실패 시 무시
+            event_resp = self._api_post(
+                API_ENDPOINTS["event_today"],
+                {"energy": [self._energy_code], "page": 0, "size": 20}
+            )
+            if event_resp:
+                payload = self._get_response_data(event_resp) or event_resp.get("data", event_resp)
+                events = self._extract_list(payload) if payload else []
+                for evt in events:
+                    if not isinstance(evt, dict):
+                        continue
+                    grade = str(self._extract_value(evt, "grade", "level", "severity", "type") or "").lower()
+                    if grade in ("error", "critical", "fault", "danger"):
+                        status_data["is_normal"] = False
+                        msg = self._extract_value(
+                            evt, "message", "description", "eventName", "content"
+                        ) or "이벤트 감지"
+                        status_data["error_messages"].append(str(msg))
 
             logger.info(f"컨버터 상태: {'정상' if status_data['is_normal'] else '이상'}")
             return status_data
@@ -213,108 +325,50 @@ class HevitonScraper:
         """
         logger.info(f"최근 {days}일 발전량 조회")
 
+        recent_data = []
+        today = datetime.now()
+        start_date = (today - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+
         try:
-            # 이력 페이지로 이동
-            url = f"{self.base_url}/monitoring/stat/history.do?ua=m&inType=web"
-            self.driver.get(url)
-            time.sleep(3)
+            if not self._get_plant_info():
+                return self._empty_daily_data(days)
 
-            recent_data = []
+            # plantDetailTrendPrimary (POST) - 일별 추이
+            resp = self._api_post(
+                API_ENDPOINTS["plant_detail_ranged"],
+                self._make_plant_payload(
+                    date_type="day",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
+            if resp:
+                payload = self._get_response_data(resp) or resp.get("data", resp)
+                items = self._extract_list(payload) if payload else []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    date_str = self._extract_value(
+                        item, "date", "genDate", "collectDate", "statDate"
+                    ) or ""
+                    gen_value = self._extract_value(
+                        item, "generation", "genAmount", "dayGen", "value", "totalGen"
+                    )
+                    if date_str:
+                        try:
+                            parsed = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+                            date_formatted = parsed.strftime("%m/%d")
+                        except ValueError:
+                            date_formatted = str(date_str)
+                        recent_data.append({
+                            "date": date_formatted,
+                            "generation": str(gen_value) if gen_value is not None else "-",
+                        })
 
-            # JavaScript로 차트 데이터 추출 시도
-            try:
-                time.sleep(3)
-
-                # 차트 데이터나 테이블 데이터 추출
-                # 방법 1: JavaScript 변수에서 추출
-                chart_data = self.driver.execute_script("""
-                    if (typeof chartData !== 'undefined') return chartData;
-                    if (typeof dayData !== 'undefined') return dayData;
-                    if (typeof dailyData !== 'undefined') return dailyData;
-                    return null;
-                """)
-
-                if chart_data and isinstance(chart_data, list):
-                    for item in chart_data[-days:]:
-                        if isinstance(item, dict):
-                            recent_data.append(item)
-
-            except Exception as e:
-                logger.debug(f"차트 데이터 추출 실패: {e}")
-
-            # 방법 2: 통계 페이지에서 테이블 데이터 추출
+            # 폴백: 빈 데이터
             if not recent_data:
-                url = f"{self.base_url}/monitoring/stat/statistics.do?ua=m&inType=web&energyCode=501"
-                self.driver.get(url)
-                time.sleep(3)
-
-                page_source = self.driver.page_source
-                soup = BeautifulSoup(page_source, 'lxml')
-
-                # 테이블에서 데이터 추출 (일별 발전량 테이블 찾기)
-                tables = soup.find_all('table')
-                for table in tables:
-                    rows = table.find_all('tr')
-                    # 헤더 확인: "기간"과 "총발전량" 컬럼이 있는 테이블 찾기
-                    if rows:
-                        header = rows[0].get_text(strip=True)
-                        if '기간' in header and '발전량' in header:
-                            # 모든 데이터 행 수집
-                            all_data = []
-                            for row in rows[1:]:  # 헤더 제외한 모든 행
-                                cols = row.find_all(['td', 'th'])
-                                if len(cols) >= 2:
-                                    date_text = cols[0].get_text(strip=True)
-                                    value_text = cols[1].get_text(strip=True)
-                                    # 날짜 형식 확인 (YYYY.MM.DD 또는 MM/DD)
-                                    # "합계", "기간" 등 헤더/푸터 행 제외
-                                    if date_text and value_text and ('.' in date_text or '/' in date_text):
-                                        if '합계' in date_text or '기간' in date_text:
-                                            continue  # 합계 행 건너뛰기
-                                        # 날짜를 MM/DD 형식으로 변환
-                                        if '.' in date_text:
-                                            parts = date_text.split('.')
-                                            if len(parts) >= 3:
-                                                date_text = f"{parts[1]}/{parts[2]}"
-                                        all_data.append({
-                                            "date": date_text,
-                                            "generation": value_text,
-                                        })
-                            # 날짜 기준 정렬 후 최근 N일 추출
-                            if all_data:
-                                # 날짜를 파싱하여 정렬 (MM/DD 형식, 연말/연초 처리)
-                                today = datetime.now()
-                                current_year = today.year
-                                current_month = today.month
-
-                                def parse_date_to_comparable(item):
-                                    try:
-                                        parts = item["date"].split("/")
-                                        month, day = int(parts[0]), int(parts[1])
-                                        # 연말에 1월 데이터가 있으면 다음 해로 처리
-                                        year = current_year
-                                        if current_month == 12 and month == 1:
-                                            year = current_year + 1
-                                        elif current_month == 1 and month == 12:
-                                            year = current_year - 1
-                                        return (year, month, day)
-                                    except:
-                                        return (0, 0, 0)
-
-                                all_data.sort(key=parse_date_to_comparable)
-                                recent_data = all_data[-days:]
-                            break  # 일별 테이블 찾았으면 종료
-
-            # 방법 3: 모니터링 페이지의 시간별 그래프 데이터로 일별 합산
-            if not recent_data:
-                # 최근 5일 날짜 생성 (오늘 포함)
-                today = datetime.now()
-                for i in range(days - 1, -1, -1):  # 역순으로 생성하여 오래된 날짜부터 최근 날짜 순서로
-                    date = today - timedelta(days=i)
-                    recent_data.append({
-                        "date": date.strftime("%m/%d"),
-                        "generation": "-",  # 데이터 없음
-                    })
+                return self._empty_daily_data(days)
 
             logger.info(f"최근 {days}일 발전량 데이터: {len(recent_data)} 건")
             return recent_data[:days]
@@ -323,72 +377,134 @@ class HevitonScraper:
             logger.error(f"최근 발전량 조회 실패: {e}")
             return []
 
+    def _empty_daily_data(self, days: int) -> list:
+        """빈 일별 데이터 생성"""
+        today = datetime.now()
+        return [
+            {
+                "date": (today - timedelta(days=i)).strftime("%m/%d"),
+                "generation": "-",
+            }
+            for i in range(days - 1, -1, -1)
+        ]
+
     def get_statistics_data(self) -> Dict[str, Any]:
         """
-        통계 페이지에서 발전량 데이터 추출
+        통계 데이터 조회
 
         Returns:
             일별/월별 통계 데이터
         """
         logger.info("통계 데이터 조회")
 
+        data = {"daily": [], "monthly": []}
+
         try:
-            # 통계 페이지로 이동
-            url = f"{self.base_url}/monitoring/stat/statistics.do?ua=m&inType=web&energyCode=501"
-            self.driver.get(url)
-            time.sleep(3)
+            if not self._get_plant_info():
+                return {"collected_at": datetime.now().isoformat(), "data": data}
 
-            page_source = self.driver.page_source
-            soup = BeautifulSoup(page_source, 'lxml')
+            today = datetime.now()
+            start_of_month = today.replace(day=1).strftime("%Y-%m-%d")
+            end_date = today.strftime("%Y-%m-%d")
 
-            data = {
-                "daily": [],
-                "monthly": [],
-            }
-
-            # 테이블 데이터 추출
-            tables = soup.find_all('table')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows[1:]:  # 헤더 제외
-                    cols = row.find_all(['td', 'th'])
-                    if len(cols) >= 2:
-                        date_text = cols[0].get_text(strip=True)
-                        value_text = cols[1].get_text(strip=True)
-                        if date_text and value_text:
-                            data["daily"].append({
-                                "date": date_text,
-                                "generation": value_text,
-                            })
+            resp = self._api_post(
+                API_ENDPOINTS["plant_detail_ranged"],
+                self._make_plant_payload(
+                    date_type="day",
+                    start_date=start_of_month,
+                    end_date=end_date,
+                )
+            )
+            if resp:
+                payload = self._get_response_data(resp) or resp.get("data", resp)
+                items = self._extract_list(payload) if payload else []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    date_str = self._extract_value(item, "date", "genDate", "statDate") or ""
+                    gen_value = self._extract_value(item, "generation", "genAmount", "value") or ""
+                    data["daily"].append({
+                        "date": str(date_str),
+                        "generation": str(gen_value),
+                    })
 
             logger.info(f"추출된 통계 데이터: {len(data['daily'])} 건")
-            return {
-                "collected_at": datetime.now().isoformat(),
-                "data": data,
-            }
+            return {"collected_at": datetime.now().isoformat(), "data": data}
 
         except Exception as e:
             logger.error(f"통계 데이터 조회 실패: {e}")
-            return {"error": str(e), "data": {}}
+            return {"error": str(e), "data": data}
+
+    def get_year_statistics(self) -> Dict[str, Any]:
+        """
+        연도별 발전 통계 조회 (발전량, 발전시간, 일사량, 온도)
+
+        Returns:
+            연도별 통계 데이터
+        """
+        logger.info("연도별 통계 데이터 조회")
+
+        result = {"years": [], "this_year": {}}
+
+        try:
+            if not self._get_plant_info():
+                return result
+
+            today = datetime.now()
+            resp = self._api_post(
+                API_ENDPOINTS["plant_detail_ranged"],
+                self._make_plant_payload(
+                    date_type="year",
+                    start_date=str(today.year - 2),
+                    end_date=str(today.year),
+                )
+            )
+            if resp:
+                payload = self._get_response_data(resp)
+                if isinstance(payload, dict):
+                    items = payload.get("list", [])
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        year_data = {
+                            "date": item.get("date", ""),
+                            "gen": round(item.get("gen", 0), 2),
+                            "genTime": round(item.get("genTime", 0), 3),
+                            "rad": round(item.get("rad", 0), 4) if item.get("rad") is not None else None,
+                            "temp": round(item.get("temp", 0), 2) if item.get("temp") is not None else None,
+                        }
+                        result["years"].append(year_data)
+                        if str(year_data["date"]) == str(today.year):
+                            result["this_year"] = year_data
+
+            logger.info(f"연도별 통계: {len(result['years'])}년")
+            return result
+
+        except Exception as e:
+            logger.error(f"연도별 통계 조회 실패: {e}")
+            return result
 
     def get_all_data(self) -> Dict[str, Any]:
         """
         모든 발전량 데이터 조회
 
         Returns:
-            통합 데이터
+            통합 데이터 (기존 구조 호환)
         """
         logger.info("전체 발전량 데이터 조회 시작")
 
-        # 1. 모니터링 데이터 (현재/오늘/월별/누적 발전량)
+        # 1. 모니터링 데이터 (발전량, 발전시간, 가동일수 포함)
         monitoring = self.get_monitoring_data()
         mon_data = monitoring.get("data", {})
 
-        # 2. 컨버터 상태 확인
+        # 2. 컨버터 상태
         converter_status = self.get_converter_status()
 
         # 3. 최근 5일 발전량
         recent_5days = self.get_recent_daily_data(5)
+
+        # 4. 연도별 통계 (일사량, 온도 포함)
+        year_stats = self.get_year_statistics()
 
         return {
             "collected_at": datetime.now().isoformat(),
@@ -414,9 +530,100 @@ class HevitonScraper:
                 "month_generation": mon_data.get("month_generation"),
                 "total_generation": mon_data.get("total_generation"),
             },
+            "operation": {
+                "day_avg_time": mon_data.get("day_avg_time"),
+                "month_avg_time": mon_data.get("month_avg_time"),
+                "tot_avg_time": mon_data.get("tot_avg_time"),
+                "day_diff": mon_data.get("day_diff"),
+                "month_diff": mon_data.get("month_diff"),
+                "oper_day": mon_data.get("oper_day"),
+                "recent_date": mon_data.get("recent_date"),
+            },
+            "year_statistics": year_stats,
             "converter_status": converter_status,
             "recent_5days": recent_5days,
         }
+
+
+def discover_api(session: requests.Session):
+    """API 엔드포인트 탐색 (개발/디버깅용)"""
+    api_base = HEVITON_CONFIG["api_base"]
+
+    # GET 엔드포인트 (JS 번들에서 확인)
+    get_endpoints = {"end_user_info", "plant_info", "user_profile"}
+    skip = {"login", "logout", "token_reissue"}
+
+    # 먼저 endUserInfo로 발전소 정보 조회
+    print(f"\n{'='*60}")
+    print("[end_user_info] GET - 발전소 기본 정보 조회")
+    url = f"{api_base}/{API_ENDPOINTS['end_user_info']}"
+    plant_name = None
+    energy_code = None
+    plant_id = None
+    try:
+        resp = session.get(url, timeout=30)
+        print(f"Status: {resp.status_code}")
+        data = resp.json()
+        print(f"Response: {resp.text[:500]}")
+        payload = data.get("data", data)
+        if isinstance(payload, dict):
+            plant_name = payload.get("plantName", payload.get("plant_name"))
+            energy_code = str(payload.get("energyCode", payload.get("energy_code", "501")))
+            plant_id = str(payload.get("plantId", payload.get("plant_id", "")))
+            print(f"\n  -> plantId={plant_id}, plantName={plant_name}, energyCode={energy_code}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # 나머지 엔드포인트 탐색
+    for name, endpoint in API_ENDPOINTS.items():
+        if name in skip or name == "end_user_info":
+            continue
+
+        url = f"{api_base}/{endpoint}"
+        is_get = name in get_endpoints
+        method = "GET" if is_get else "POST"
+
+        print(f"\n{'='*60}")
+        print(f"[{name}] {method} {url}")
+
+        try:
+            if is_get:
+                suffix = f"/{plant_id}" if name == "plant_info" and plant_id else ""
+                resp = session.get(url + suffix, timeout=30)
+            else:
+                # POST: plant_name 필드에 plantId 전달 (API 규칙)
+                payload = {}
+                if plant_id and energy_code:
+                    payload = {"plant_name": plant_id, "energy": energy_code}
+                    if name == "plant_detail_ranged":
+                        today = datetime.now()
+                        payload.update({
+                            "date_type": "day",
+                            "start_date": (today - timedelta(days=5)).strftime("%Y-%m-%d"),
+                            "end_date": today.strftime("%Y-%m-%d"),
+                        })
+                resp = session.post(url, json=payload, timeout=30)
+
+            print(f"Status: {resp.status_code}")
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    print(f"Keys: {list(data.keys())}")
+                    result = data.get("result", {})
+                    if isinstance(result, dict):
+                        print(f"  result: code={result.get('code')}, message={result.get('message', '')}")
+                    inner = data.get("data")
+                    if isinstance(inner, dict):
+                        print(f"  data Keys: {list(inner.keys())}")
+                    elif isinstance(inner, list):
+                        print(f"  data: list[{len(inner)}]")
+                        if inner and isinstance(inner[0], dict):
+                            print(f"  first item keys: {list(inner[0].keys())}")
+                print(f"Body: {resp.text[:500]}")
+            except Exception:
+                print(f"Body (non-JSON): {resp.text[:300]}")
+        except Exception as e:
+            print(f"Error: {e}")
 
 
 # 테스트용
@@ -426,9 +633,9 @@ if __name__ == "__main__":
 
     from auth import HevitonAuth
 
-    with HevitonAuth(headless=True) as auth:
+    with HevitonAuth() as auth:
         if auth.is_logged_in:
-            scraper = HevitonScraper(auth.get_driver())
+            scraper = HevitonScraper(auth.get_session())
             data = scraper.get_all_data()
             print(json.dumps(data, indent=2, ensure_ascii=False))
         else:

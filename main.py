@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Heviton 태양광 발전량 모니터링 크롤러
-일 1회 실행하여 발전량 데이터를 수집하고 잔디로 전송
+Heviton REMS 태양광 발전량 모니터링 데이터 수집기
+일 1회 실행하여 REST API로 발전량 데이터를 수집하고 잔디로 전송
 
 Usage:
     python main.py              # 전체 데이터 수집 및 전송
@@ -9,6 +9,7 @@ Usage:
     python main.py --weekly     # 주별 데이터만
     python main.py --monthly    # 월별 데이터만
     python main.py --test       # 테스트 메시지 전송
+    python main.py --discover   # API 엔드포인트 탐색 (개발용)
 """
 import os
 import sys
@@ -23,7 +24,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from config.settings import LOGGING_CONFIG, LOGS_DIR
 from src.auth import HevitonAuth
-from src.scraper import HevitonScraper
+from src.scraper import HevitonScraper, discover_api
 from src.jandi_webhook import JandiWebhook
 from src.google_sheets import GoogleSheetsClient
 
@@ -68,15 +69,15 @@ def run_scraper(args):
 
     auth = None
     try:
-        # 로그인 및 데이터 수집 (Selenium 기반)
-        auth = HevitonAuth(headless=True)
+        # 로그인 및 데이터 수집 (REST API)
+        auth = HevitonAuth()
         if not auth.login():
             error_msg = "로그인 실패 - 인증 정보를 확인하세요."
             logger.error(error_msg)
             jandi.send_error_alert(error_msg)
             return 1
 
-        scraper = HevitonScraper(auth.get_driver())
+        scraper = HevitonScraper(auth.get_session())
 
         # 데이터 수집
         data = scraper.get_all_data()
@@ -162,6 +163,30 @@ def test_webhook():
         return 1
 
 
+def run_discover():
+    """API 엔드포인트 탐색"""
+    logger = logging.getLogger(__name__)
+    logger.info("API 엔드포인트 탐색 모드")
+
+    auth = None
+    try:
+        auth = HevitonAuth()
+        if not auth.login():
+            print("로그인 실패 - 인증 정보를 확인하세요.")
+            return 1
+
+        discover_api(auth.get_session())
+        return 0
+
+    except Exception as e:
+        logger.exception(f"탐색 중 오류: {e}")
+        return 1
+
+    finally:
+        if auth:
+            auth.logout()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Heviton 태양광 발전량 모니터링 크롤러"
@@ -186,17 +211,23 @@ def main():
         "--debug", action="store_true",
         help="디버그 모드"
     )
+    parser.add_argument(
+        "--discover", action="store_true",
+        help="API 엔드포인트 탐색 (개발/디버깅용)"
+    )
 
     args = parser.parse_args()
 
     # 로깅 설정
-    if args.debug:
+    if args.debug or args.discover:
         LOGGING_CONFIG["level"] = "DEBUG"
     setup_logging()
 
     # 실행
     if args.test:
         return test_webhook()
+    elif args.discover:
+        return run_discover()
     else:
         return run_scraper(args)
 

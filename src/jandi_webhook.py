@@ -80,7 +80,7 @@ class JandiWebhook:
         발전량 리포트 전송
 
         Args:
-            data: 발전량 데이터 (daily, weekly, monthly, dashboard 포함)
+            data: 발전량 데이터 (daily, weekly, monthly, dashboard, operation, year_statistics 포함)
 
         Returns:
             bool: 전송 성공 여부
@@ -93,46 +93,62 @@ class JandiWebhook:
         # 대시보드 요약 (새로운 구조)
         dashboard = data.get("dashboard", {})
         if isinstance(dashboard, dict) and not dashboard.get("data"):
-            # 새로운 구조: dashboard가 직접 데이터를 담고 있음
             current_power = dashboard.get("current_power")
             today_gen = dashboard.get("today_generation")
             month_gen = dashboard.get("month_generation")
             total_gen = dashboard.get("total_generation")
 
-            if current_power:
-                # 현재 발전량 (W -> kW 변환)
-                try:
-                    power_kw = float(current_power) / 1000
-                    power_str = f"{power_kw:.2f} kW"
-                except:
-                    power_str = f"{current_power} W"
-
+            if current_power is not None:
                 connect_info.append({
                     "title": "⚡ 현재 발전량",
-                    "description": power_str,
+                    "description": f"{current_power} kW",
                 })
 
-            if today_gen:
+            if today_gen is not None:
+                # 발전시간 포함
+                operation = data.get("operation", {})
+                day_time = operation.get("day_avg_time")
+                day_diff = operation.get("day_diff")
+                desc_parts = [f"{today_gen} kWh"]
+                if day_time is not None:
+                    desc_parts.append(f"발전시간 {day_time}h")
+                if day_diff is not None:
+                    sign = "+" if day_diff > 0 else ""
+                    desc_parts.append(f"전일대비 {sign}{day_diff}%")
                 connect_info.append({
                     "title": f"📅 오늘 발전량 ({data.get('daily', {}).get('date', datetime.now().strftime('%Y-%m-%d'))})",
-                    "description": f"{today_gen} kWh",
+                    "description": " | ".join(desc_parts),
                 })
 
-            if month_gen:
+            if month_gen is not None:
+                operation = data.get("operation", {})
+                month_time = operation.get("month_avg_time")
+                desc_parts = [f"{month_gen} kWh"]
+                if month_time is not None:
+                    desc_parts.append(f"평균 발전시간 {month_time}h")
                 connect_info.append({
                     "title": f"📊 이번달 발전량 ({data.get('monthly', {}).get('year_month', datetime.now().strftime('%Y-%m'))})",
-                    "description": f"{month_gen} kWh",
+                    "description": " | ".join(desc_parts),
                 })
 
-            if total_gen:
+            if total_gen is not None:
+                operation = data.get("operation", {})
+                oper_day = operation.get("oper_day")
+                try:
+                    total_mwh = float(total_gen) / 1000
+                    gen_str = f"{total_mwh:,.2f} MWh"
+                except (ValueError, TypeError):
+                    gen_str = f"{total_gen} kWh"
+                desc_parts = [gen_str]
+                if oper_day is not None:
+                    desc_parts.append(f"가동 {oper_day}일")
                 connect_info.append({
                     "title": "📈 누적 발전량",
-                    "description": f"{total_gen} MWh",
+                    "description": " | ".join(desc_parts),
                 })
 
         # 기존 구조 지원 (호환성)
         else:
-            # 일별 발전량
             if "daily" in data:
                 daily = data["daily"]
                 daily_total = daily.get("total")
@@ -142,7 +158,6 @@ class JandiWebhook:
                         "description": f"{daily_total} kWh",
                     })
 
-            # 월별 발전량
             if "monthly" in data:
                 monthly = data["monthly"]
                 monthly_total = monthly.get("total")
@@ -152,7 +167,24 @@ class JandiWebhook:
                         "description": f"{monthly_total} kWh",
                     })
 
-        # 컨버터 상태 추가
+        # 연도별 통계 (일사량, 온도)
+        year_stats = data.get("year_statistics", {})
+        this_year = year_stats.get("this_year", {})
+        if this_year:
+            year_parts = []
+            if this_year.get("gen") is not None:
+                year_parts.append(f"발전량 {this_year['gen']:,.0f}kWh")
+            if this_year.get("rad") is not None:
+                year_parts.append(f"일사량 {this_year['rad']}kWh/m2")
+            if this_year.get("temp") is not None:
+                year_parts.append(f"온도 {this_year['temp']}°C")
+            if year_parts:
+                connect_info.append({
+                    "title": f"🌤️ {datetime.now().year}년 요약",
+                    "description": " | ".join(year_parts),
+                })
+
+        # 컨버터 상태
         converter_status = data.get("converter_status", {})
         if converter_status:
             is_normal = converter_status.get("is_normal")
@@ -169,10 +201,9 @@ class JandiWebhook:
                     "description": f"이상 감지: {error_text}",
                 })
 
-        # 최근 5일 발전량 추가
+        # 최근 5일 발전량
         recent_5days = data.get("recent_5days", [])
         if recent_5days:
-            # 최근 5일 데이터를 한 줄로 표시
             recent_text_parts = []
             for day_data in recent_5days:
                 date = day_data.get("date", "")
