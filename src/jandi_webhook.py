@@ -167,21 +167,26 @@ class JandiWebhook:
                         "description": f"{monthly_total} kWh",
                     })
 
-        # 연도별 통계 (일사량, 온도)
-        year_stats = data.get("year_statistics", {})
-        this_year = year_stats.get("this_year", {})
-        if this_year:
-            year_parts = []
-            if this_year.get("gen") is not None:
-                year_parts.append(f"발전량 {this_year['gen']:,.0f}kWh")
-            if this_year.get("rad") is not None:
-                year_parts.append(f"일사량 {this_year['rad']}kWh/m2")
-            if this_year.get("temp") is not None:
-                year_parts.append(f"온도 {this_year['temp']}°C")
-            if year_parts:
+        # 오늘 날씨
+        today_weather = data.get("today_weather", {})
+        if today_weather:
+            weather_parts = []
+            if today_weather.get("weather") is not None:
+                weather_parts.append(f"{today_weather['weather']}")
+            high = today_weather.get("high_temp")
+            low = today_weather.get("low_temp")
+            if high is not None and low is not None:
+                weather_parts.append(f"{low}~{high}°C")
+            elif high is not None:
+                weather_parts.append(f"{high}°C")
+            if today_weather.get("humidity") is not None:
+                weather_parts.append(f"습도 {today_weather['humidity']}%")
+            if today_weather.get("radiation") is not None:
+                weather_parts.append(f"일사량 {today_weather['radiation']}kWh/m²")
+            if weather_parts:
                 connect_info.append({
-                    "title": f"🌤️ {datetime.now().year}년 요약",
-                    "description": " | ".join(year_parts),
+                    "title": "🌤️ 오늘 날씨",
+                    "description": " | ".join(weather_parts),
                 })
 
         # 컨버터 상태

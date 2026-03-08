@@ -104,6 +104,12 @@ class HevitonScraper:
                 # envelope 없이 직접 data인 경우
                 payload = data.get("data", data)
 
+            # 응답이 { "list": [...] } 형태인 경우 첫 번째 항목 추출
+            if isinstance(payload, dict) and "list" in payload:
+                items = payload.get("list", [])
+                if isinstance(items, list) and items:
+                    payload = items[0]
+
             if isinstance(payload, dict):
                 self._plant_id = str(payload.get("plantId", payload.get("plant_id", "")))
                 self._plant_name = payload.get("plantName", payload.get("plant_name", ""))
@@ -313,26 +319,28 @@ class HevitonScraper:
             logger.error(f"컨버터 상태 조회 실패: {e}")
             return {"is_normal": None, "error": str(e)}
 
-    def get_recent_daily_data(self, days: int = 5) -> list:
+    def get_recent_daily_data(self, days: int = 5) -> tuple:
         """
-        최근 N일간 일별 발전량 데이터 조회
+        최근 N일간 일별 발전량 데이터 및 오늘 날씨 조회
 
         Args:
             days: 조회할 일수 (기본 5일)
 
         Returns:
-            최근 N일간 발전량 리스트
+            (최근 N일간 발전량 리스트, 오늘 날씨 dict)
         """
         logger.info(f"최근 {days}일 발전량 조회")
 
         recent_data = []
+        today_weather = {}
         today = datetime.now()
-        start_date = (today - timedelta(days=days - 1)).strftime("%Y-%m-%d")
-        end_date = today.strftime("%Y-%m-%d")
+        today_str = today.strftime("%Y%m%d")
+        start_date = (today - timedelta(days=days - 1)).strftime("%Y%m%d")
+        end_date = today_str
 
         try:
             if not self._get_plant_info():
-                return self._empty_daily_data(days)
+                return self._empty_daily_data(days), today_weather
 
             # plantDetailTrendPrimary (POST) - 일별 추이
             resp = self._api_post(
@@ -353,14 +361,31 @@ class HevitonScraper:
                         item, "date", "genDate", "collectDate", "statDate"
                     ) or ""
                     gen_value = self._extract_value(
-                        item, "generation", "genAmount", "dayGen", "value", "totalGen"
+                        item, "gen", "generation", "genAmount", "dayGen", "value", "totalGen"
                     )
+
+                    # 오늘 날씨 정보 추출
+                    raw_date = str(date_str).replace("-", "")[:8]
+                    if raw_date == today_str:
+                        today_weather = {
+                            "weather": item.get("weth"),
+                            "high_temp": item.get("highTemp"),
+                            "low_temp": item.get("lowTemp"),
+                            "humidity": item.get("reh"),
+                            "radiation": item.get("rad"),
+                        }
+
                     if date_str:
                         try:
-                            parsed = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+                            parsed = datetime.strptime(raw_date, "%Y%m%d")
                             date_formatted = parsed.strftime("%m/%d")
                         except ValueError:
                             date_formatted = str(date_str)
+                        if gen_value is not None:
+                            try:
+                                gen_value = round(float(gen_value), 2)
+                            except (ValueError, TypeError):
+                                pass
                         recent_data.append({
                             "date": date_formatted,
                             "generation": str(gen_value) if gen_value is not None else "-",
@@ -368,14 +393,14 @@ class HevitonScraper:
 
             # 폴백: 빈 데이터
             if not recent_data:
-                return self._empty_daily_data(days)
+                return self._empty_daily_data(days), today_weather
 
             logger.info(f"최근 {days}일 발전량 데이터: {len(recent_data)} 건")
-            return recent_data[:days]
+            return recent_data[:days], today_weather
 
         except Exception as e:
             logger.error(f"최근 발전량 조회 실패: {e}")
-            return []
+            return [], today_weather
 
     def _empty_daily_data(self, days: int) -> list:
         """빈 일별 데이터 생성"""
@@ -404,8 +429,8 @@ class HevitonScraper:
                 return {"collected_at": datetime.now().isoformat(), "data": data}
 
             today = datetime.now()
-            start_of_month = today.replace(day=1).strftime("%Y-%m-%d")
-            end_date = today.strftime("%Y-%m-%d")
+            start_of_month = today.replace(day=1).strftime("%Y%m%d")
+            end_date = today.strftime("%Y%m%d")
 
             resp = self._api_post(
                 API_ENDPOINTS["plant_detail_ranged"],
@@ -422,7 +447,7 @@ class HevitonScraper:
                     if not isinstance(item, dict):
                         continue
                     date_str = self._extract_value(item, "date", "genDate", "statDate") or ""
-                    gen_value = self._extract_value(item, "generation", "genAmount", "value") or ""
+                    gen_value = self._extract_value(item, "gen", "generation", "genAmount", "value") or ""
                     data["daily"].append({
                         "date": str(date_str),
                         "generation": str(gen_value),
@@ -500,11 +525,8 @@ class HevitonScraper:
         # 2. 컨버터 상태
         converter_status = self.get_converter_status()
 
-        # 3. 최근 5일 발전량
-        recent_5days = self.get_recent_daily_data(5)
-
-        # 4. 연도별 통계 (일사량, 온도 포함)
-        year_stats = self.get_year_statistics()
+        # 3. 최근 5일 발전량 + 오늘 날씨
+        recent_5days, today_weather = self.get_recent_daily_data(5)
 
         return {
             "collected_at": datetime.now().isoformat(),
@@ -539,7 +561,7 @@ class HevitonScraper:
                 "oper_day": mon_data.get("oper_day"),
                 "recent_date": mon_data.get("recent_date"),
             },
-            "year_statistics": year_stats,
+            "today_weather": today_weather,
             "converter_status": converter_status,
             "recent_5days": recent_5days,
         }
@@ -566,6 +588,11 @@ def discover_api(session: requests.Session):
         data = resp.json()
         print(f"Response: {resp.text[:500]}")
         payload = data.get("data", data)
+        # 응답이 { "list": [...] } 형태인 경우 첫 번째 항목 추출
+        if isinstance(payload, dict) and "list" in payload:
+            items = payload.get("list", [])
+            if isinstance(items, list) and items:
+                payload = items[0]
         if isinstance(payload, dict):
             plant_name = payload.get("plantName", payload.get("plant_name"))
             energy_code = str(payload.get("energyCode", payload.get("energy_code", "501")))
