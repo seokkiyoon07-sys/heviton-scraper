@@ -4,10 +4,10 @@ Heviton REMS 태양광 발전량 모니터링 데이터 수집기
 일 1회 실행하여 REST API로 발전량 데이터를 수집하고 잔디로 전송
 
 Usage:
-    python main.py              # 전체 데이터 수집 및 전송
-    python main.py --daily      # 일별 데이터만
-    python main.py --weekly     # 주별 데이터만
-    python main.py --monthly    # 월별 데이터만
+    python main.py                      # 전체 데이터 수집 및 전송
+    python main.py --report-period daily    # 일별 절감 리포트
+    python main.py --report-period weekly   # 주별 절감 리포트
+    python main.py --report-period monthly  # 월별 절감 리포트
     python main.py --test       # 테스트 메시지 전송
     python main.py --discover   # API 엔드포인트 탐색 (개발용)
 """
@@ -15,7 +15,7 @@ import os
 import sys
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 프로젝트 루트 경로 추가
@@ -27,6 +27,12 @@ from src.auth import HevitonAuth
 from src.scraper import HevitonScraper, discover_api
 from src.jandi_webhook import JandiWebhook
 from src.google_sheets import GoogleSheetsClient
+from src.tariff import (
+    estimate_savings,
+    estimate_daily_savings_from_hourly,
+    estimate_period_savings_from_daily_records,
+)
+from config.settings import SAVINGS_CONFIG
 
 # 환경변수 로드
 load_dotenv()
@@ -121,6 +127,136 @@ def run_scraper(args):
             auth.logout()
 
 
+def run_savings_report(period: str) -> int:
+    """절감액 리포트 실행 (daily/weekly/monthly)"""
+    logger = logging.getLogger(__name__)
+    period = str(period).lower().strip()
+    if period not in {"daily", "weekly", "monthly"}:
+        logger.error(f"지원하지 않는 report period: {period}")
+        return 1
+
+    try:
+        jandi = get_jandi_webhook()
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
+
+    auth = None
+    try:
+        auth = HevitonAuth()
+        if not auth.login():
+            error_msg = "로그인 실패 - 인증 정보를 확인하세요."
+            logger.error(error_msg)
+            jandi.send_error_alert(error_msg)
+            return 1
+
+        scraper = HevitonScraper(auth.get_session())
+        tou_rates = SAVINGS_CONFIG.get("tou_rates", {})
+        tou_ratios = SAVINGS_CONFIG.get("tou_ratios", {})
+        currency = SAVINGS_CONFIG.get("currency", "원")
+        tariff_name = SAVINGS_CONFIG.get("tariff_name", "")
+
+        if period == "daily":
+            data = scraper.get_all_data()
+            dashboard = data.get("dashboard", {}) if isinstance(data.get("dashboard"), dict) else {}
+            hourly = data.get("today_hourly", [])
+
+            hourly_result = estimate_daily_savings_from_hourly(hourly, tou_rates)
+            weighted_result = estimate_savings(
+                today_generation=dashboard.get("today_generation"),
+                month_generation=dashboard.get("month_generation"),
+                tou_rates=tou_rates,
+                tou_ratios=tou_ratios,
+            )
+            result = hourly_result or weighted_result
+            if not result:
+                jandi.send_error_alert("일별 절감액 계산 실패: 발전량/요금 데이터가 없습니다.")
+                return 1
+
+            today_gen = result.get("today_generation")
+            if today_gen is None:
+                try:
+                    today_gen = float(dashboard.get("today_generation"))
+                except (TypeError, ValueError):
+                    today_gen = None
+
+            parts = []
+            if today_gen is not None:
+                parts.append(f"발전량 {today_gen:,.2f}kWh")
+            parts.append(f"절감액 {result.get('today_saving', 0):,.0f}{currency}")
+            parts.append(f"적용단가 {result.get('weighted_unit_price', 0):,.2f}{currency}/kWh")
+            if tariff_name:
+                parts.append(f"요금제 {tariff_name}")
+            if hourly_result:
+                period_kwh = hourly_result.get("kwh_by_period", {})
+                parts.append(
+                    "실측 경/중/최 "
+                    f"{period_kwh.get('off_peak', 0.0):.2f}/"
+                    f"{period_kwh.get('mid_peak', 0.0):.2f}/"
+                    f"{period_kwh.get('on_peak', 0.0):.2f}kWh"
+                )
+            else:
+                parts.append("시간대 비율 추정")
+
+            return 0 if jandi.send_message(
+                body=f"💰 일별 절감 리포트 ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                color="#2ECC71",
+                connect_info=[{
+                    "title": f"📅 일별 절감 ({datetime.now().strftime('%Y-%m-%d')})",
+                    "description": " | ".join(parts),
+                }],
+            ) else 1
+
+        today = datetime.now()
+        if period == "weekly":
+            end = today
+            start = today - timedelta(days=6)
+            title = f"📆 주별 절감 ({start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')})"
+        else:
+            first_this = today.replace(day=1)
+            end = first_this - timedelta(days=1)
+            start = end.replace(day=1)
+            title = f"🗓️ 월별 절감 ({start.strftime('%Y-%m')})"
+
+        records = scraper.get_daily_generation_range(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+        result = estimate_period_savings_from_daily_records(records, tou_rates, tou_ratios)
+        if not result:
+            jandi.send_error_alert(f"{period} 절감액 계산 실패: 기간 발전량 데이터가 없습니다.")
+            return 1
+
+        parts = [
+            f"발전량 {result['total_generation']:,.2f}kWh",
+            f"절감액 {result['total_saving']:,.0f}{currency}",
+            f"평균단가 {result['avg_unit_price']:,.2f}{currency}/kWh",
+            f"산정일수 {result['days']}일",
+            "일별 합계 기준 추정",
+        ]
+        if tariff_name:
+            parts.append(f"요금제 {tariff_name}")
+
+        emoji = "📈" if period == "weekly" else "📊"
+        return 0 if jandi.send_message(
+            body=f"💰 {period} 절감 리포트 ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+            color="#1ABC9C",
+            connect_info=[{
+                "title": title.replace("📆", emoji).replace("🗓️", emoji),
+                "description": " | ".join(parts),
+            }],
+        ) else 1
+
+    except Exception as e:
+        error_msg = f"절감 리포트 실행 중 오류 발생: {str(e)}"
+        logger.exception(error_msg)
+        try:
+            jandi.send_error_alert(error_msg)
+        except Exception:
+            pass
+        return 1
+    finally:
+        if auth:
+            auth.logout()
+
+
 def test_webhook():
     """웹훅 테스트"""
     logger = logging.getLogger(__name__)
@@ -193,15 +329,20 @@ def main():
     )
     parser.add_argument(
         "--daily", action="store_true",
-        help="일별 발전량만 수집"
+        help="일별 절감 리포트 전송"
     )
     parser.add_argument(
         "--weekly", action="store_true",
-        help="주별 발전량만 수집"
+        help="주별 절감 리포트 전송"
     )
     parser.add_argument(
         "--monthly", action="store_true",
-        help="월별 발전량만 수집"
+        help="월별 절감 리포트 전송"
+    )
+    parser.add_argument(
+        "--report-period",
+        choices=["daily", "weekly", "monthly"],
+        help="절감 리포트 주기 선택",
     )
     parser.add_argument(
         "--test", action="store_true",
@@ -228,6 +369,14 @@ def main():
         return test_webhook()
     elif args.discover:
         return run_discover()
+    elif args.report_period:
+        return run_savings_report(args.report_period)
+    elif args.daily:
+        return run_savings_report("daily")
+    elif args.weekly:
+        return run_savings_report("weekly")
+    elif args.monthly:
+        return run_savings_report("monthly")
     else:
         return run_scraper(args)
 

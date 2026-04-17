@@ -413,6 +413,151 @@ class HevitonScraper:
             for i in range(days - 1, -1, -1)
         ]
 
+    def get_today_hourly_data(self) -> list:
+        """
+        오늘 시간별 발전량 조회
+
+        Returns:
+            [{"hour": 0~23, "generation": float}, ...]
+        """
+        logger.info("오늘 시간별 발전량 조회")
+
+        hourly_data = []
+        today_str = datetime.now().strftime("%Y%m%d")
+
+        try:
+            if not self._get_plant_info():
+                return hourly_data
+
+            resp = self._api_post(
+                API_ENDPOINTS["plant_detail_ranged"],
+                self._make_plant_payload(
+                    date_type="hour",
+                    start_date=today_str,
+                    end_date=today_str,
+                )
+            )
+            if not resp:
+                return hourly_data
+
+            payload = self._get_response_data(resp) or resp.get("data", resp)
+            items = self._extract_list(payload) if payload else []
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                hour_val = self._extract_value(
+                    item, "hour", "hh", "time", "tm", "collectTime", "statTime", "date"
+                )
+                gen_val = self._extract_value(
+                    item, "gen", "generation", "genAmount", "hourGen", "value", "totalGen"
+                )
+                if hour_val is None or gen_val is None:
+                    continue
+
+                hour_str = str(hour_val).strip()
+                hour = None
+                # 0~23 형태
+                if hour_str.isdigit():
+                    hour = int(hour_str)
+                # HH:mm 또는 YYYYMMDDHH 등에서 시각 추출
+                elif ":" in hour_str:
+                    part = hour_str.split(":", 1)[0]
+                    if part.isdigit():
+                        hour = int(part)
+                elif len(hour_str) >= 10 and hour_str[-2:].isdigit():
+                    hour = int(hour_str[-2:])
+
+                if hour is None or not (0 <= hour <= 23):
+                    continue
+
+                try:
+                    gen = round(float(gen_val), 4)
+                except (TypeError, ValueError):
+                    continue
+
+                hourly_data.append({"hour": hour, "generation": gen})
+
+            # 동일 시간 중복 시 마지막 값 유지
+            uniq = {}
+            for row in hourly_data:
+                uniq[row["hour"]] = row["generation"]
+
+            normalized = [{"hour": h, "generation": uniq[h]} for h in sorted(uniq.keys())]
+            logger.info(f"시간별 발전량 데이터: {len(normalized)} 건")
+            return normalized
+
+        except Exception as e:
+            logger.error(f"시간별 발전량 조회 실패: {e}")
+            return []
+
+    def get_daily_generation_range(self, start_date: str, end_date: str) -> list:
+        """
+        기간별 일 발전량 조회
+
+        Args:
+            start_date: YYYYMMDD
+            end_date: YYYYMMDD
+
+        Returns:
+            [{"date": "YYYY-MM-DD", "generation": float}, ...]
+        """
+        logger.info(f"일 발전량 범위 조회: {start_date} ~ {end_date}")
+        rows = []
+
+        try:
+            if not self._get_plant_info():
+                return rows
+
+            resp = self._api_post(
+                API_ENDPOINTS["plant_detail_ranged"],
+                self._make_plant_payload(
+                    date_type="day",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
+            if not resp:
+                return rows
+
+            payload = self._get_response_data(resp) or resp.get("data", resp)
+            items = self._extract_list(payload) if payload else []
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                date_str = self._extract_value(item, "date", "genDate", "collectDate", "statDate")
+                gen_val = self._extract_value(item, "gen", "generation", "genAmount", "dayGen", "value", "totalGen")
+                if date_str is None or gen_val is None:
+                    continue
+
+                raw = str(date_str).replace("-", "")[:8]
+                try:
+                    dt = datetime.strptime(raw, "%Y%m%d")
+                    date_out = dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+
+                try:
+                    gen = round(float(gen_val), 4)
+                except (TypeError, ValueError):
+                    continue
+
+                rows.append({"date": date_out, "generation": gen})
+
+            # 날짜 오름차순 정렬 및 중복 제거
+            dedup = {}
+            for row in rows:
+                dedup[row["date"]] = row["generation"]
+            normalized = [{"date": d, "generation": dedup[d]} for d in sorted(dedup.keys())]
+            logger.info(f"일 발전량 범위 데이터: {len(normalized)} 건")
+            return normalized
+
+        except Exception as e:
+            logger.error(f"일 발전량 범위 조회 실패: {e}")
+            return []
+
     def get_statistics_data(self) -> Dict[str, Any]:
         """
         통계 데이터 조회
@@ -528,6 +673,9 @@ class HevitonScraper:
         # 3. 최근 5일 발전량 + 오늘 날씨
         recent_5days, today_weather = self.get_recent_daily_data(5)
 
+        # 4. 오늘 시간별 발전량
+        today_hourly = self.get_today_hourly_data()
+
         return {
             "collected_at": datetime.now().isoformat(),
             "daily": {
@@ -564,6 +712,7 @@ class HevitonScraper:
             "today_weather": today_weather,
             "converter_status": converter_status,
             "recent_5days": recent_5days,
+            "today_hourly": today_hourly,
         }
 
 
