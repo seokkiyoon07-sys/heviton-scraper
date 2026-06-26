@@ -8,7 +8,8 @@ from typing import Dict, Any, Optional, List
 
 import sys
 sys.path.append(str(__file__).rsplit('/', 2)[0])
-from config.settings import REQUEST_CONFIG
+from config.settings import REQUEST_CONFIG, SAVINGS_CONFIG
+from src.tariff import estimate_savings, estimate_daily_savings_from_hourly
 
 logger = logging.getLogger(__name__)
 
@@ -167,21 +168,89 @@ class JandiWebhook:
                         "description": f"{monthly_total} kWh",
                     })
 
-        # 연도별 통계 (일사량, 온도)
-        year_stats = data.get("year_statistics", {})
-        this_year = year_stats.get("this_year", {})
-        if this_year:
-            year_parts = []
-            if this_year.get("gen") is not None:
-                year_parts.append(f"발전량 {this_year['gen']:,.0f}kWh")
-            if this_year.get("rad") is not None:
-                year_parts.append(f"일사량 {this_year['rad']}kWh/m2")
-            if this_year.get("temp") is not None:
-                year_parts.append(f"온도 {this_year['temp']}°C")
-            if year_parts:
+        # 발전 절감액 (시간대 요금)
+        if SAVINGS_CONFIG.get("enabled"):
+            dashboard = data.get("dashboard", {}) if isinstance(data.get("dashboard"), dict) else {}
+            weighted_savings = estimate_savings(
+                today_generation=dashboard.get("today_generation"),
+                month_generation=dashboard.get("month_generation"),
+                tou_rates=SAVINGS_CONFIG.get("tou_rates", {}),
+                tou_ratios=SAVINGS_CONFIG.get("tou_ratios", {}),
+            )
+            hourly_savings = estimate_daily_savings_from_hourly(
+                hourly_data=data.get("today_hourly", []),
+                tou_rates=SAVINGS_CONFIG.get("tou_rates", {}),
+            )
+            savings = hourly_savings or weighted_savings
+            if savings:
+                today_saving = savings.get("today_saving")
+                month_saving = weighted_savings.get("month_saving") if weighted_savings else None
+                weighted = savings.get("weighted_unit_price")
+                season = savings.get("season")
+
+                season_text = {
+                    "summer": "하계",
+                    "winter": "동계",
+                    "spring_fall": "봄가을",
+                }.get(str(season), str(season))
+
+                desc_parts = [f"가중단가 {weighted:,.2f}{SAVINGS_CONFIG['currency']}/kWh ({season_text})"]
+                if today_saving is not None:
+                    desc_parts.append(f"오늘 {today_saving:,.0f}{SAVINGS_CONFIG['currency']}")
+                if month_saving is not None:
+                    desc_parts.append(f"이번달 {month_saving:,.0f}{SAVINGS_CONFIG['currency']}")
+                if hourly_savings:
+                    period_kwh = hourly_savings.get("kwh_by_period", {})
+                    off = period_kwh.get("off_peak", 0.0)
+                    mid = period_kwh.get("mid_peak", 0.0)
+                    onp = period_kwh.get("on_peak", 0.0)
+                    desc_parts.append(f"실측분배 경/중/최 {off:.2f}/{mid:.2f}/{onp:.2f}kWh")
+                    desc_parts.append("오늘값 기준: 시간별 실측")
+                else:
+                    desc_parts.append("오늘값 기준: 시간대 비율 추정")
+                tariff_name = SAVINGS_CONFIG.get("tariff_name")
+                if tariff_name:
+                    desc_parts.append(f"요금제 {tariff_name}")
+
+                contract_power = SAVINGS_CONFIG.get("contract_power_kw")
+                basic_per_kw = SAVINGS_CONFIG.get("basic_charge_per_kw")
+                if isinstance(contract_power, (int, float)) and isinstance(basic_per_kw, (int, float)):
+                    basic_monthly = contract_power * basic_per_kw
+                    desc_parts.append(
+                        f"월 기본요금 {basic_monthly:,.0f}{SAVINGS_CONFIG['currency']} "
+                        f"({contract_power:g}kW×{basic_per_kw:,.0f})"
+                    )
+
                 connect_info.append({
-                    "title": f"🌤️ {datetime.now().year}년 요약",
-                    "description": " | ".join(year_parts),
+                    "title": "💰 예상 절감액",
+                    "description": " | ".join(desc_parts),
+                })
+
+        # 오늘 날씨
+        today_weather = data.get("today_weather", {})
+        if today_weather:
+            weather_parts = []
+            if today_weather.get("weather") is not None:
+                weather_parts.append(f"{today_weather['weather']}")
+            high = today_weather.get("high_temp")
+            low = today_weather.get("low_temp")
+            if high is not None and low is not None:
+                weather_parts.append(f"{low}~{high}°C")
+            elif high is not None:
+                weather_parts.append(f"{high}°C")
+            if today_weather.get("humidity") is not None:
+                weather_parts.append(f"습도 {today_weather['humidity']}%")
+            if today_weather.get("radiation") is not None:
+                radiation = today_weather.get("radiation")
+                try:
+                    radiation_text = f"{float(radiation):.5f}"
+                except (ValueError, TypeError):
+                    radiation_text = str(radiation)
+                weather_parts.append(f"일사량 {radiation_text}kWh/m²")
+            if weather_parts:
+                connect_info.append({
+                    "title": "🌤️ 오늘 날씨",
+                    "description": " | ".join(weather_parts),
                 })
 
         # 컨버터 상태
